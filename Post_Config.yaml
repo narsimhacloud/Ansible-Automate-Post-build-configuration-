@@ -1,0 +1,101 @@
+---
+- name: Post-Build Configuration for Linux VMs
+  hosts: all
+  become: yes
+  vars:
+    disk_mounts:
+      - { device: "/dev/sda1", mount_point: "/mnt/data", fstype: "ext4" }
+    user_accounts:
+      - { username: "admin", groups: "sudo", password: "{{ admin_password | password_hash('sha512') }}" }
+    nexpose_scan_url: "http://nexpose-server:3780/api/3/site"
+    nexpose_scan_credentials:
+      username: "nexpose_user"
+      password: "nexpose_password"
+
+  tasks:
+    - name: Format and mount disks
+      filesystem:
+        fstype: "{{ item.fstype }}"
+        device: "{{ item.device }}"
+      loop: "{{ disk_mounts }}"
+      ignore_errors: yes
+
+    - name: Create mount points
+      file:
+        path: "{{ item.mount_point }}"
+        state: directory
+      loop: "{{ disk_mounts }}"
+
+    - name: Mount disks
+      mount:
+        path: "{{ item.mount_point }}"
+        src: "{{ item.device }}"
+        fstype: "{{ item.fstype }}"
+        state: mounted
+      loop: "{{ disk_mounts }}"
+
+    - name: Ensure swap partition is configured
+      command: "fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+      when: ansible_facts.swaps | length == 0
+
+    - name: Create user accounts
+      user:
+        name: "{{ item.username }}"
+        groups: "{{ item.groups }}"
+        password: "{{ item.password }}"
+        state: present
+      loop: "{{ user_accounts }}"
+
+    - name: Run Nexpose scan
+      uri:
+        url: "{{ nexpose_scan_url }}"
+        method: POST
+        user: "{{ nexpose_scan_credentials.username }}"
+        password: "{{ nexpose_scan_credentials.password }}"
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        body: '{"scan": "true"}'
+      register: nexpose_scan_result
+
+    - name: Print Nexpose scan result
+      debug:
+        msg: "{{ nexpose_scan_result.json }}"
+
+    - name: Apply security hardening 
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+
+    - name: Restart SSH service
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Add network configuration 
+      lineinfile:
+        path: /etc/network/interfaces
+        line: 'iface eth0 inet static\naddress 192.168.1.100\nnetmask 255.255.255.0\ngateway 192.168.1.1'
+        create: yes
+
+    - name: Set up monitoring 
+      apt:
+        name: monitoring-agent
+        state: present
+
+    - name: Configure firewall
+      ufw:
+        rule: allow
+        name: '80/tcp'
+
+    - name: Ensure services are running
+      service:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: Update system packages
+      apt:
+        upgrade: dist
